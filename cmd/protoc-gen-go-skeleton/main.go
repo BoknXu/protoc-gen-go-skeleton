@@ -8,8 +8,10 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/types/pluginpb"
 )
 
 func main() {
@@ -30,6 +33,9 @@ func main() {
 	}
 
 	opts.Run(func(plugin *protogen.Plugin) error {
+		// 显式声明支持 proto3 optional，避免 protoc 直接拒绝执行插件。
+		plugin.SupportedFeatures |= uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
+
 		// 未指定 domain：按输入的所有 proto 正常逐 service 生成。
 		if domain == "" {
 			for _, file := range plugin.Files {
@@ -84,7 +90,7 @@ func generateDomainFile(plugin *protogen.Plugin, domain string, files []*protoge
 		return nil
 	}
 	// domain 模式固定生成单文件：<domain>.go
-	fileName := d + ".go"
+	fileName := toSnakeCase(strings.ReplaceAll(d, "/", "_")) + ".go"
 	baseImportPath := files[0].GoImportPath
 
 	specs := make([]serviceSpec, 0)
@@ -106,6 +112,8 @@ func generateDomainFile(plugin *protogen.Plugin, domain string, files []*protoge
 func generateServiceFile(plugin *protogen.Plugin, file *protogen.File, service *protogen.Service) error {
 	// 默认模式下按 service 拆分文件，方便独立维护。
 	fileName := serviceFileName(file.GeneratedFilenamePrefix, service.GoName)
+	// _, _ = fmt.Fprintf(os.Stderr, "处理file, namePrefix=%s, name=%s\n", file.GeneratedFilenamePrefix, fileName)
+	fileName = locateExistingServiceFile(service.GoName, fileName)
 	appImportPath := file.GoImportPath
 	content, err := buildMergedFileContent(fileName, "source: "+file.Desc.Path(), []serviceSpec{{file: file, service: service}})
 	if err != nil {
@@ -122,9 +130,12 @@ func applicationName(serviceGoName string) string {
 }
 
 func serviceFileName(generatedPrefix, serviceGoName string) string {
-	_ = generatedPrefix
-	base := toLowerFirst(trimServiceSuffix(serviceGoName))
-	return base + ".go"
+	// generatedPrefix 可能带目录层级，这里先取最后一层再拼文件名。
+	last := path.Base(generatedPrefix)
+	if last == "" || last == "." || last == "/" {
+		last = toSnakeCase(trimServiceSuffix(serviceGoName))
+	}
+	return last + ".go"
 }
 
 func trimServiceSuffix(serviceGoName string) string {
@@ -141,6 +152,46 @@ func toLowerFirst(s string) string {
 	}
 	r, n := utf8.DecodeRuneInString(s)
 	return string(unicode.ToLower(r)) + s[n:]
+}
+
+func toSnakeCase(s string) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	var prev rune
+	for i, r := range s {
+		switch {
+		case r == '-' || r == ' ' || r == '.':
+			if b.Len() > 0 && prev != '_' {
+				b.WriteRune('_')
+				prev = '_'
+			}
+			continue
+		case r == '_':
+			if b.Len() > 0 && prev != '_' {
+				b.WriteRune('_')
+				prev = '_'
+			}
+			continue
+		case unicode.IsUpper(r):
+			if i > 0 && prev != '_' && (unicode.IsLower(prev) || unicode.IsDigit(prev)) {
+				b.WriteRune('_')
+			}
+			l := unicode.ToLower(r)
+			b.WriteRune(l)
+			prev = l
+		default:
+			l := unicode.ToLower(r)
+			b.WriteRune(l)
+			prev = l
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "generated"
+	}
+	return out
 }
 
 func unaryMethodImpl(imports *importManager, appName string, method *protogen.Method) string {
@@ -311,19 +362,22 @@ func buildMergedFileContent(filePath, sourceComment string, specs []serviceSpec)
 	addedDecls := make([]string, 0)
 	for _, spec := range specs {
 		appName := applicationName(spec.service.GoName)
-		serverAlias := ensurePBImport(imports, string(spec.file.GoImportPath), string(spec.file.GoPackageName))
+		// 已存在文件时，保持最小增量：仅补缺失的方法，不新增 struct/构造函数。
+		// 不存在文件时，从头生成文件
+		if !exists {
+			serverAlias := ensurePBImport(imports, string(spec.file.GoImportPath), string(spec.file.GoPackageName))
+			if !st.hasStruct[appName] {
+				structDecl := fmt.Sprintf("type %s struct {\n\t%s.Unimplemented%sServer\n}", appName, serverAlias, spec.service.GoName)
+				serviceDoc := adaptServiceComment(protoComment(spec.service.Comments), spec.service.GoName, appName)
+				addedDecls = append(addedDecls, withDocComment(serviceDoc, structDecl))
+				st.hasStruct[appName] = true
+			}
 
-		if !st.hasStruct[appName] {
-			structDecl := fmt.Sprintf("type %s struct {\n\t%s.Unimplemented%sServer\n}", appName, serverAlias, spec.service.GoName)
-			serviceDoc := adaptServiceComment(protoComment(spec.service.Comments), spec.service.GoName, appName)
-			addedDecls = append(addedDecls, withDocComment(serviceDoc, structDecl))
-			st.hasStruct[appName] = true
-		}
-
-		ctorName := "New" + appName
-		if !st.hasFunc[ctorName] {
-			addedDecls = append(addedDecls, fmt.Sprintf("func %s() *%s {\n\treturn &%s{}\n}", ctorName, appName, appName))
-			st.hasFunc[ctorName] = true
+			ctorName := "New" + appName
+			if !st.hasFunc[ctorName] {
+				addedDecls = append(addedDecls, fmt.Sprintf("func %s() *%s {\n\treturn &%s{}\n}", ctorName, appName, appName))
+				st.hasFunc[ctorName] = true
+			}
 		}
 
 		for _, method := range spec.service.Methods {
@@ -342,11 +396,25 @@ func buildMergedFileContent(filePath, sourceComment string, specs []serviceSpec)
 		}
 	}
 
-	mergedImports := imports.snapshot()
-	if exists && len(addedDecls) == 0 && sameImportSet(st.imports, mergedImports) {
-		return readOriginalContent(existingPath)
+	if exists {
+		original, err := readOriginalContent(existingPath)
+		if err != nil {
+			return "", err
+		}
+
+		if len(addedDecls) == 0 {
+			return original, nil
+		}
+
+		additionalImports := diffNewImports(st.imports, imports.snapshot())
+		updated, err := injectMissingImports(original, additionalImports)
+		if err != nil {
+			return "", err
+		}
+		return appendDeclsToFile(updated, addedDecls), nil
 	}
 
+	mergedImports := imports.snapshot()
 	var buf bytes.Buffer
 	buf.WriteString("// Code generated by protoc-gen-go-skeleton.\n")
 	buf.WriteString("// " + sourceComment + "\n\n")
@@ -392,18 +460,183 @@ func buildMergedFileContent(filePath, sourceComment string, specs []serviceSpec)
 	return string(formatted), nil
 }
 
-func resolveExistingFilePath(fileName string) string {
-	// 先尝试当前目录，再兼容常见的目标目录（例如 --go-skeleton_out=...:./internal/application）。
-	candidates := []string{
-		fileName,
-		path.Join("internal", "application", fileName),
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
+func diffNewImports(oldImports, newImports map[string]string) map[string]string {
+	added := make(map[string]string)
+	for p, alias := range newImports {
+		if _, ok := oldImports[p]; !ok {
+			added[p] = alias
 		}
 	}
-	return fileName
+	return added
+}
+
+func injectMissingImports(content string, additional map[string]string) (string, error) {
+	if len(additional) == 0 {
+		return content, nil
+	}
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", content, parser.ParseComments)
+	if err != nil {
+		return "", err
+	}
+
+	importPaths := make([]string, 0, len(additional))
+	for p := range additional {
+		importPaths = append(importPaths, p)
+	}
+	sort.Strings(importPaths)
+
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			continue
+		}
+		if gd.Lparen.IsValid() {
+			insertPos := fset.Position(gd.Rparen).Offset
+			lines := make([]string, 0, len(importPaths))
+			for _, p := range importPaths {
+				alias := additional[p]
+				if alias == "" {
+					lines = append(lines, "\t"+strconv.Quote(p))
+				} else {
+					lines = append(lines, "\t"+alias+" "+strconv.Quote(p))
+				}
+			}
+			toInsert := strings.Join(lines, "\n") + "\n"
+			return content[:insertPos] + toInsert + content[insertPos:], nil
+		}
+	}
+
+	// 没有 import block（或只有单行 import）时，不改动原有 import，额外追加一个 import block。
+	insertPos := fset.Position(f.Name.End()).Offset
+	blockLines := make([]string, 0, len(importPaths)+2)
+	blockLines = append(blockLines, "\n\nimport (")
+	for _, p := range importPaths {
+		alias := additional[p]
+		if alias == "" {
+			blockLines = append(blockLines, "\t"+strconv.Quote(p))
+		} else {
+			blockLines = append(blockLines, "\t"+alias+" "+strconv.Quote(p))
+		}
+	}
+	blockLines = append(blockLines, ")")
+	toInsert := strings.Join(blockLines, "\n")
+	return content[:insertPos] + toInsert + content[insertPos:], nil
+}
+
+func appendDeclsToFile(content string, decls []string) string {
+	if len(decls) == 0 {
+		return content
+	}
+	trimmed := strings.TrimRight(content, "\n")
+	var b strings.Builder
+	b.WriteString(trimmed)
+	b.WriteString("\n\n")
+	for i, d := range decls {
+		b.WriteString(strings.TrimSpace(d))
+		if i < len(decls)-1 {
+			b.WriteString("\n\n")
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func resolveExistingFilePath(fileName string) string {
+	// 优先当前目录，同时兼容常见输出目录。
+	candidates := []string{
+		filepath.FromSlash(fileName),
+		filepath.Join("internal", "application", filepath.FromSlash(fileName)),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return filepath.FromSlash(fileName)
+}
+
+func locateExistingServiceFile(serviceName, defaultFileName string) string {
+	appName := applicationName(serviceName)
+	searchRoots := []string{
+		filepath.Join("internal", "application"),
+	}
+	visited := map[string]struct{}{}
+	for _, root := range searchRoots {
+		cleanRoot := filepath.Clean(root)
+		if _, ok := visited[cleanRoot]; ok {
+			continue
+		}
+		visited[cleanRoot] = struct{}{}
+		matched := findGoFileByApplication(cleanRoot, appName)
+		if matched != "" {
+			// 只返回文件名，让输出目录完全由 --go-skeleton_out 冒号后的路径控制，
+			// 避免生成 internal/application/internal/application 这种重复层级。
+			return filepath.Base(matched)
+		}
+	}
+	return defaultFileName
+}
+
+func findGoFileByApplication(rootDir, appName string) string {
+	info, err := os.Stat(rootDir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+
+	var found string
+	_ = filepath.WalkDir(rootDir, func(pathName string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			//// 跳过常见无关目录，减少扫描开销。
+			//switch name {
+			//case ".git", "vendor", "node_modules", ".idea":
+			//	return fs.SkipDir
+			//}
+			return nil
+		}
+		if filepath.Ext(name) != ".go" {
+			return nil
+		}
+		if strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		// _, _ = fmt.Fprintf(os.Stderr, "在path=%s寻找app=%s\n", pathName, appName)
+		if goFileHasApplication(pathName, appName) {
+			found = pathName
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+func goFileHasApplication(filePath, appName string) bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filePath, nil, 0)
+	if err != nil {
+		return false
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != appName {
+				continue
+			}
+			if _, ok := ts.Type.(*ast.StructType); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func ensurePBImport(imports *importManager, importPath, preferredPkg string) string {
