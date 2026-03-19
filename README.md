@@ -6,11 +6,12 @@
 
 - 每个 `service` 对应一个 `Application` 结构体
 - 每个 `service` 对应一个构造函数
-- unary rpc 的空实现（默认返回 unimplemented 错误）
+- unary rpc 的空实现（保留 `// coding here...` 并返回空响应）
 
 默认生成文件命名：
 
-- `application/<service>.go`（例如 `application/welcome.go`）
+- `<service>.go`（例如 `welcome.go`）
+- 输出目录由 `--go-skeleton_out` 决定
 
 ## 1）安装
 
@@ -71,14 +72,14 @@ protoc \
 执行后你会得到：
 
 - `path/to/your.pb.go`（由 `protoc-gen-go` 生成）
-- `path/to/application/<service>.go`（由 `protoc-gen-go-skeleton` 生成）
+- `<输出目录>/<service>.go`（由 `protoc-gen-go-skeleton` 生成）
 
 ### 可选参数：`domain`
 
 你可以通过 `--go-skeleton_out` 传递插件参数。
 
 - 不传 `domain`：对当前 `CodeGeneratorRequest` 里的所有 proto 生成
-- `domain=welcome`：只处理 `welcome/` 下的 proto，并只输出一个文件：`application/welcome.go`
+- `domain=welcome`：只处理 `welcome/` 下的 proto，并只输出一个文件：`<输出目录>/welcome.go`
 
 示例：
 
@@ -86,7 +87,7 @@ protoc \
 protoc \
   --proto_path=. \
   --go_out=. \
-  --go-skeleton_out=domain=welcome:. \
+  --go-skeleton_out=paths=source_relative,domain=welcome:./internal/application \
   $(find . -name "*.proto")
 ```
 
@@ -96,8 +97,8 @@ protoc \
 
 - `<ServiceBaseName>Application`
 - `New<ServiceBaseName>Application()`
-- 嵌入 `pb.Unimplemented<ServiceName>Server`
+- 嵌入 `welcomePB.Unimplemented<ServiceName>Server`（pb 包使用 `xxxPB` 别名）
 - unary 方法：
-  - `func (app *XxxApplication) Hello(ctx context.Context, req *pb.HelloReq) (*pb.HelloReply, error)`
+  - `func (app *XxxApplication) Hello(ctx context.Context, req *welcomePB.HelloReq) (*welcomePB.HelloReply, error)`
 
 流式 rpc 不会生成自定义方法，保持嵌入的 `Unimplemented...Server` 默认行为。
