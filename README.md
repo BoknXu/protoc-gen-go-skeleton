@@ -15,10 +15,10 @@
 
 ## 1）安装
 
-编译并安装到你的 `GOBIN`：
+远程安装到你的 `GOBIN`：
 
 ```bash
-go install ./cmd/protoc-gen-go-skeleton
+go install github.com/BoknXu/protoc-gen-go-skeleton@latest
 ```
 
 ## 2）proto 示例
