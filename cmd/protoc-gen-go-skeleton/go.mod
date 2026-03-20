@@ -1,4 +1,4 @@
-module protoc-gen-go-skeleton/cmd/protoc-gen-go-skeleton
+module github.com/BoknXu/protoc-gen-go-skeleton
 
 go 1.26
 
